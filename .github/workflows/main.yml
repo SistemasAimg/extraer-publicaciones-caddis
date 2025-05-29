@@ -23,7 +23,7 @@ jobs:
     - uses: actions/checkout@v4
 
     - id: auth
-      name: Authenticate with Google Cloud
+      name: Authenticate with Google CloudSPREADSHEET_ID_PUBLICACIONES
       uses: google-github-actions/auth@v2
       with:
         workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}

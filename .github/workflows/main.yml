@@ -20,44 +20,50 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - id: auth
-      name: Authenticate with Google CloudSPREADSHEET_ID_PUBLICACIONES
-      uses: google-github-actions/auth@v2
-      with:
-        workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
-        service_account: cloudrun@storage-entorno-de-desarrollo.iam.gserviceaccount.com
-        project_id: ${{ env.PROJECT_ID }}
+      - id: auth
+        name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: cloudrun@storage-entorno-de-desarrollo.iam.gserviceaccount.com
+          project_id: ${{ env.PROJECT_ID }}
 
-    - name: Set up Cloud SDK
-      uses: google-github-actions/setup-gcloud@v2
-      with:
-        project_id: ${{ env.PROJECT_ID }}
-        install_components: 'beta,gke-gcloud-auth-plugin'
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          install_components: 'beta,gke-gcloud-auth-plugin'
 
-    - name: Configure Docker for Artifact Registry
-      run: gcloud auth configure-docker gcr.io --quiet
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker gcr.io --quiet
 
-    - name: Build and push Docker image
-      run: |
-        docker build -t gcr.io/${{ env.PROJECT_ID }}/${{ env.JOB_NAME }}:${{ github.sha }} .
-        docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.JOB_NAME }}:${{ github.sha }}
+      - name: Build and push Docker image
+        run: |
+          docker build -t gcr.io/${{ env.PROJECT_ID }}/${{ env.JOB_NAME }}:${{ github.sha }} .
+          docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.JOB_NAME }}:${{ github.sha }}
 
-    - name: Deploy to Cloud Run Job
-      run: |
+      - name: Deploy to Cloud Run Job
+        run: |
+          # Intentar actualizar; si falla por inexistente, crearlo
           if ! gcloud run jobs update ${{ env.JOB_NAME }} \
             --image gcr.io/${{ env.PROJECT_ID }}/${{ env.JOB_NAME }}:${{ github.sha }} \
             --region ${{ env.REGION }} \
             --set-env-vars "SPREADSHEET_ID=${{ secrets.SPREADSHEET_ID_PUBLICACIONES }},WORKLOAD_IDENTITY_PROVIDER=${{ env.WORKLOAD_IDENTITY_PROVIDER }}" \
-            --service-account=${{ secrets.SERVICE_ACCOUNT }}; then
+            --service-account=${{ secrets.SERVICE_ACCOUNT }} \
+            --tasks=1 \
+            --memory=512Mi \
+            --task-timeout=900s \
+            --max-retries=1; then
 
             gcloud run jobs create ${{ env.JOB_NAME }} \
               --image gcr.io/${{ env.PROJECT_ID }}/${{ env.JOB_NAME }}:${{ github.sha }} \
               --region ${{ env.REGION }} \
               --set-env-vars "SPREADSHEET_ID=${{ secrets.SPREADSHEET_ID_PUBLICACIONES }},WORKLOAD_IDENTITY_PROVIDER=${{ env.WORKLOAD_IDENTITY_PROVIDER }}" \
               --service-account=${{ secrets.SERVICE_ACCOUNT }} \
-              --max-retries=1 \
+              --tasks=1 \
               --memory=512Mi \
-              --timeout=900s
+              --task-timeout=900s \
+              --max-retries=1
           fi

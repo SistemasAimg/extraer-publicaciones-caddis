@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Extrae las publicaciones (listados por tienda) del ERP Caddis y las vuelca en una
-hoja de Google Sheets con una tabla plana.  
-Se autentica con Workload Identity Federation (misma lógica que tu script de
-stock). Pensado para correr en un Cloud Run Job disparado por GitHub Actions.
+Extrae las publicaciones (listados por tienda) del ERP Caddis y las vuelca en
+Google Sheets en formato tabla plana.
 
-Env vars necesarios en Cloud Run:
-  SPREADSHEET_ID   → ID de la planilla destino
-  WORKLOAD_IDENTITY_PROVIDER → mismo que en el job de stock
-  SHEET_NAME (opcional)      → nombre de la pestaña, por defecto "publicaciones"
+Pensado para un Cloud Run Job con Workload Identity Federation, disparado por
+GitHub Actions.
+
+Variables de entorno (Cloud Run):
+  SPREADSHEET_ID            → ID de la planilla destino
+  WORKLOAD_IDENTITY_PROVIDER→ Provider WIF (para compatibilidad, aunque el
+                               script usa `google.auth.default()`)
+  SHEET_NAME (opcional)     → Pestaña destino, por defecto "publicaciones"
 """
 
 import os
@@ -18,19 +20,17 @@ from typing import List, Dict
 
 import requests
 import gspread
-from google.auth import default  # Workload Identity Federation creds
+from google.auth import default  # Credenciales vía WIF
 
 # ---------------------------------------------------------------------------
-# Configuración estática
+# Configuración
 # ---------------------------------------------------------------------------
 API_URL = "https://api.caddis.com.ar/v1"
 CREDENTIALS = {
     "usuario": "GPSMUNDO-TEST",
     "password": "875c471f5ad0b48114193d35f3ef45f6",
 }
-PAGE_LIMIT = 5000  # Caddis usa este límite en los endpoints de paginación
 
-# Columnas del sheet en el orden que se escribirán
 HEADER = [
     "sku",
     "tienda_id",
@@ -45,90 +45,74 @@ HEADER = [
     "fecha_extraccion",
 ]
 
-
 # ---------------------------------------------------------------------------
-# Utilidades de entorno y autenticación
+# Helpers de entorno y login
 # ---------------------------------------------------------------------------
 
 def _validate_env() -> Dict[str, str]:
-    """Asegura que existan las env vars necesarias y las devuelve."""
-    required = {
-        "SPREADSHEET_ID": "ID de la hoja de cálculo de destino (en la URL)",
-        "WORKLOAD_IDENTITY_PROVIDER": "ID del Workload Identity Provider",
+    req = {
+        "SPREADSHEET_ID": "ID de la planilla destino",
     }
-    missing = [k for k in required if not os.getenv(k)]
+    missing = [k for k in req if not os.getenv(k)]
     if missing:
-        print("\nFaltan variables de entorno:")
-        for k in missing:
-            print(f"  {k}: {required[k]}")
+        print("Faltan env vars requeridas:", ", ".join(missing))
         sys.exit(1)
-
     return {
         "spreadsheet_id": os.getenv("SPREADSHEET_ID"),
-        "wip": os.getenv("WORKLOAD_IDENTITY_PROVIDER"),
         "sheet_name": os.getenv("SHEET_NAME", "publicaciones"),
     }
 
 
 def _login() -> str:
-    """Obtiene access_token Caddis."""
-    print("▶ Iniciando login en Caddis…")
-    try:
-        resp = requests.post(f"{API_URL}/login", json=CREDENTIALS, timeout=30)
-        resp.raise_for_status()
-        token = resp.json()["body"]["access_token"]
-        print("✔ Login OK")
-        return token
-    except requests.RequestException as err:
-        print("✖ Error autenticando en Caddis:", err)
-        raise
-
+    print("▶ Login Caddis …")
+    r = requests.post(f"{API_URL}/login", json=CREDENTIALS, timeout=30)
+    r.raise_for_status()
+    token = r.json()["body"]["access_token"]
+    print("✔ Token OK")
+    return token
 
 # ---------------------------------------------------------------------------
-# Extracción de publicaciones
+# Descarga de publicaciones con paginación
 # ---------------------------------------------------------------------------
 
 def _fetch_publicaciones(token: str) -> List[Dict]:
-    """Itera páginas hasta agotar resultados y devuelve la lista plana."""
-    print("▶ Descargando publicaciones… (límite página", PAGE_LIMIT, ")")
+    print("▶ Descargando publicaciones …")
     headers = {"Authorization": f"Bearer {token}"}
     page = 1
     registros: List[Dict] = []
 
     while True:
-        url = f"{API_URL}/articulos/publicaciones?pagina={page}&limite={PAGE_LIMIT}"
-        try:
-            resp = requests.get(url, headers=headers, timeout=60)
-            resp.raise_for_status()
-            data = resp.json()
-            body = data.get("body", [])
-            if not body:
-                print(f"  • Página {page} vacía. Fin de paginación.")
-                break
-            registros.extend(body)
-            print(f"  • Página {page}: {len(body)} SKUs → acumulado {len(registros)}")
-            page += 1
-        except requests.RequestException as err:
-            # Si Caddis responde 404 cuando no hay más páginas
-            if getattr(err.response, "status_code", None) == 404:
-                print(f"  • Página {page} devolvió 404. Fin de paginación.")
-                break
-            raise
+        url = f"{API_URL}/articulos/publicaciones?pagina={page}"
+        r = requests.get(url, headers=headers, timeout=60)
+
+        if r.status_code == 404:
+            print(f"  • Página {page} 404 ⇒ fin de paginación.")
+            break
+        if r.status_code >= 400:
+            print(f"✖ Error {r.status_code}: {r.text}")
+            r.raise_for_status()
+
+        data = r.json().get("body", [])
+        if not data:
+            print(f"  • Página {page} vacía ⇒ fin de paginación.")
+            break
+
+        registros.extend(data)
+        print(f"  • Página {page}: {len(data)} SKUs (acum: {len(registros)})")
+        page += 1
 
     return registros
 
-
 # ---------------------------------------------------------------------------
-# Transformación
+# Transformación a filas para Sheets
 # ---------------------------------------------------------------------------
 
 def _flatten(raw: List[Dict]) -> List[List]:
-    """Convierte la estructura nested en filas listas para Sheets."""
-    ts = datetime.utcnow().isoformat(timespec="seconds")
+    ts = datetime.utcnow().isoformat(sep="T", timespec="seconds")
     rows: List[List] = []
-    for item in raw:
-        sku = item["sku"]
-        for pub in item.get("publicaciones", []):
+    for art in raw:
+        sku = art["sku"]
+        for pub in art.get("publicaciones", []):
             rows.append([
                 sku,
                 pub["tienda"]["id"],
@@ -145,14 +129,13 @@ def _flatten(raw: List[Dict]) -> List[List]:
     print(f"▶ Filas generadas: {len(rows)}")
     return rows
 
-
 # ---------------------------------------------------------------------------
-# Google Sheets
+# Escritura en Google Sheets
 # ---------------------------------------------------------------------------
 
-def _write_to_sheet(rows: List[List], cfg: Dict[str, str]):
-    print("▶ Conectando a Google Sheets…")
-    creds, _ = default()  # Workload Identity Federation
+def _write(rows: List[List], cfg: Dict[str, str]):
+    print("▶ Conectando a Google Sheets …")
+    creds, _ = default()
     gc = gspread.authorize(creds)
     ss = gc.open_by_key(cfg["spreadsheet_id"])
 
@@ -161,28 +144,22 @@ def _write_to_sheet(rows: List[List], cfg: Dict[str, str]):
     except gspread.WorksheetNotFound:
         ws = ss.add_worksheet(title=cfg["sheet_name"], rows="1", cols=str(len(HEADER)))
 
-    # Limpiar todo manteniendo el mismo worksheet
     ws.clear()
-    # Escribir encabezado y datos en una sola llamada
     ws.append_rows([HEADER] + rows, value_input_option="USER_ENTERED")
-    print(f"✔ Escribí {len(rows)} filas (más encabezado) en '{ws.title}'.")
-
+    print(f"✔ Hoja '{ws.title}' actualizada ({len(rows)} filas).")
 
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
 def main():
-    print("=== Publicaciones → Google Sheets ===")
-    print("Fecha/Hora UTC:", datetime.utcnow())
-
+    print("=== Publicaciones → Sheets ===", datetime.utcnow().isoformat())
     cfg = _validate_env()
     token = _login()
     raw = _fetch_publicaciones(token)
     rows = _flatten(raw)
-    _write_to_sheet(rows, cfg)
-
-    print("=== Proceso finalizado OK ===")
+    _write(rows, cfg)
+    print("=== Proceso completado OK ===")
 
 
 if __name__ == "__main__":

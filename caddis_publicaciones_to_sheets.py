@@ -82,7 +82,7 @@ def _fetch_publicaciones(token: str) -> List[Dict]:
     registros: List[Dict] = []
 
     while True:
-        url = f"{API_URL}/articulos/publicaciones?pagina={page}"
+        url = f"{API_URL}/ecommerce/publicaciones?pagina={page}"
         r = requests.get(url, headers=headers, timeout=60)
 
         if r.status_code == 404:
